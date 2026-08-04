@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: backend
+
+  datasource:
+    url: jdbc:postgresql://recallops-dev-30784.j77.aws-ap-south-1.cockroachlabs.cloud:26257/recallops?sslmode=verify-full
+    username: recallops
+    password: ${DB_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    open-in-view: false
+
+    hibernate:
+      ddl-auto: update
+
+    show-sql: true
+
+    properties:
+      hibernate:
+        format_sql: true
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
