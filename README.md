@@ -2,33 +2,34 @@
 
 > **An AI SRE agent that never forgets an investigation.**
 
-RecallOps is a fault-tolerant incident investigation system designed to demonstrate one critical capability:
+RecallOps is a fault-tolerant incident investigation system designed around one core idea:
 
-**An AI agent can crash without losing its investigation state.**
+> **An AI agent should be able to survive an application crash without losing the investigation it was working on.**
 
-When an incident occurs, RecallOps creates an investigation, allows an autonomous reasoning agent to analyze it, persists its working memory and state transitions in **CockroachDB**, and can recover the investigation after an application crash.
+When an incident occurs, RecallOps creates a persistent investigation, maintains its state and working memory, executes a reasoning engine, and continuously checkpoints important investigation context into **CockroachDB**.
 
-Instead of restarting the investigation from scratch, the agent resumes from the last durable checkpoint.
+If the application crashes during the investigation, the process can be restarted and the investigation can be reconstructed from durable state.
+
+Instead of starting the investigation from scratch, RecallOps resumes from the last persisted checkpoint.
 
 ---
 
-## The Problem
+# The Problem
 
-AI agents are increasingly being used for operational tasks such as:
+AI agents are increasingly being used for operational workflows such as:
 
 - Incident investigation
 - Root-cause analysis
 - Log analysis
 - Troubleshooting
 - Remediation planning
+- Infrastructure operations
 
-However, many agent implementations treat the agent's current reasoning state as temporary application memory.
+However, an agent's current reasoning context is often treated as temporary application state.
 
-That creates a serious reliability problem.
+Consider an SRE agent investigating a production incident:
 
-Imagine an SRE agent investigating a production incident:
-
-````text
+```text
 Incident Created
       ↓
 Agent starts investigation
@@ -43,16 +44,16 @@ Next investigation step selected
       ↓
 Application restarts
       ↓
-Agent has forgotten everything
+Agent has forgotten its context
       ↓
 Investigation starts again
 ````
-```
-For long-running or expensive investigations, losing the agent's working state is unacceptable.
+
+For long-running or expensive investigations, losing this state is unacceptable.
 
 The key question behind RecallOps is:
 
-> **What happens to an AI agent's reasoning when the process running it suddenly disappears?**
+> **What happens to an AI agent's investigation when the process running it suddenly disappears?**
 
 ---
 
@@ -62,19 +63,21 @@ RecallOps separates **ephemeral execution** from **durable investigation memory*
 
 The application process may crash, restart, or disappear.
 
-The investigation itself does not.
+The investigation itself does not have to disappear with it.
 
-Important state is persisted to CockroachDB:
+Important investigation state is persisted to CockroachDB:
 
+- Incident state
+    
 - Investigation state
     
 - State transition history
     
 - Working memory
     
-- Current hypotheses
+- Hypotheses
     
-- Evidence collected
+- Evidence
     
 - Reasoning context
     
@@ -83,98 +86,105 @@ Important state is persisted to CockroachDB:
 - Investigation progress
     
 
-After restart, RecallOps reconstructs the investigation from durable state and resumes from the last known checkpoint.
+After a restart, RecallOps can reconstruct the investigation from durable state and recover the context required to continue the investigation.
 
-````text
+```text
                  ┌─────────────────────┐
                  │       Incident       │
                  │       Created        │
                  └──────────┬──────────┘
-                            ↓
+                            │
+                            ▼
                  ┌─────────────────────┐
-                 │  Investigation      │
-                 │      Started        │
+                 │    Investigation    │
+                 │       Started       │
                  └──────────┬──────────┘
-                            ↓
+                            │
+                            ▼
                  ┌─────────────────────┐
-                 │   Reasoning Agent   │
+                 │   Reasoning Engine  │
                  │                     │
-                 │ Analyze → Hypothesis│
-                 │ → Evidence → Action │
+                 │ Analyze             │
+                 │ Hypothesize         │
+                 │ Evaluate Evidence   │
+                 │ Select Next Action  │
                  └──────────┬──────────┘
-                            ↓
+                            │
+                            ▼
                  ┌─────────────────────┐
                  │   Durable Memory    │
                  │                     │
-                 │ CockroachDB         │
-                 │                     │
-                 │ State               │
-                 │ History             │
+                 │ Investigation State │
+                 │ State History       │
                  │ Working Memory      │
                  └──────────┬──────────┘
                             │
                             │
                      💥 APPLICATION CRASH
                             │
-                            ↓
+                            ▼
                  ┌─────────────────────┐
                  │   Application       │
                  │      Restart        │
                  └──────────┬──────────┘
-                            ↓
+                            │
+                            ▼
                  ┌─────────────────────┐
-                 │ Recovery Service    │
+                 │   Recovery Service  │
                  │                     │
                  │ Load durable state  │
+                 │ Load working memory │
                  │ Reconstruct context │
-                 │ Resume investigation│
                  └──────────┬──────────┘
-                            ↓
+                            │
+                            ▼
                  ┌─────────────────────┐
                  │ Investigation       │
                  │      Resumes        │
                  └─────────────────────┘
-````
 ```
+
 ---
 
 # Core Idea
 
-RecallOps treats an agent investigation as a **durable state machine** rather than an in-memory conversation.
+RecallOps models an investigation as a **durable state machine** rather than simply an in-memory conversation.
 
-The agent's execution is temporary.
+The agent's execution is ephemeral.
 
 The investigation is durable.
 
+### Ephemeral
+
 ```text
-Ephemeral
-──────────────────────────────
 Application process
 Agent execution
-Current Java objects
+Java objects
 HTTP requests
 Runtime memory
+```
 
+### Durable
 
-Durable
-──────────────────────────────
+```text
 Incident
 Investigation
-State
-State history
+Current state
+State transition history
 Working memory
 Reasoning context
 Investigation progress
 ```
-````
-This distinction allows the system to recover from process failure without losing the investigation.
+
+This separation allows the application to fail without necessarily losing the investigation's durable context.
 
 ---
+
 # MVP Demonstration
 
-The MVP focuses on one powerful end-to-end workflow.
+The MVP focuses on one end-to-end failure-recovery workflow.
 
-### 1. Create an incident
+## 1. Create an incident
 
 A user creates an incident such as:
 
@@ -191,11 +201,11 @@ RecallOps creates a persistent incident record.
 
 ---
 
-### 2. Start an investigation
+## 2. Start an investigation
 
 An investigation is created for the incident.
 
-The investigation moves through controlled states:
+The investigation follows a controlled lifecycle:
 
 ```text
 CREATED
@@ -213,11 +223,11 @@ Invalid state transitions are rejected by the state machine.
 
 ---
 
-### 3. Agent investigates
+## 3. Agent investigates
 
-The reasoning engine analyzes the incident and produces a structured decision.
+The reasoning engine analyzes the investigation context and produces a structured decision.
 
-Example:
+For example:
 
 ```text
 Hypothesis:
@@ -233,15 +243,15 @@ Confidence:
 0.82
 ```
 
-The important part is that this reasoning context is not kept only in RAM.
+The important part is that this context is not required to exist only in process memory.
 
-It is persisted.
+It can be persisted as working memory.
 
 ---
 
-### 4. Working memory is checkpointed
+## 4. Working memory is checkpointed
 
-RecallOps stores the agent's investigation context in durable storage.
+RecallOps stores the investigation's reasoning context in durable storage.
 
 Example:
 
@@ -259,33 +269,33 @@ Example:
 }
 ```
 
-This becomes the agent's persistent working memory.
+This becomes persistent working memory for the investigation.
 
 ---
 
-### 5. Simulate a crash
+## 5. Simulate a crash
 
 The MVP intentionally allows the application to be terminated while an investigation is in progress.
 
 ```text
 Investigation
       ↓
-Agent reasoning
+Reasoning
       ↓
 Working memory persisted
       ↓
-💥 CRASH
+💥 APPLICATION CRASH
 ```
 
 The Java process disappears.
 
-But the investigation data remains in CockroachDB.
+The durable investigation data remains in CockroachDB.
 
 ---
 
-### 6. Restart the application
+## 6. Restart the application
 
-When RecallOps starts again, the recovery layer loads the persisted investigation.
+When RecallOps starts again, the recovery layer can load the persisted investigation context.
 
 ```text
 Application restart
@@ -300,21 +310,19 @@ Load working memory
        ↓
 Reconstruct investigation context
        ↓
-Resume
+Resume investigation
 ```
 
-The agent does not start from zero.
+The investigation does not need to be reconstructed manually.
 
 ---
 
-### 7. Investigation resumes
+## 7. Investigation resumes
 
-The recovered agent continues from the durable checkpoint.
-
-The demonstration proves:
+The key demonstration is:
 
 ```text
-Before crash:
+BEFORE CRASH
 
 Investigation #123
 State: ANALYZING
@@ -322,14 +330,14 @@ State: ANALYZING
 Hypothesis:
 Database connection exhaustion
 
-Next action:
+Next Action:
 Inspect connection pool
 
 
-        💥 CRASH
+             💥
 
 
-After restart:
+AFTER RESTART
 
 Investigation #123
 State: ANALYZING
@@ -337,15 +345,15 @@ State: ANALYZING
 Hypothesis:
 Database connection exhaustion
 
-Next action:
+Next Action:
 Inspect connection pool
 
-        ↓
+             ↓
 
 Investigation continues
 ```
 
-That is the core RecallOps story.
+The database has preserved the state required to recover the investigation.
 
 ---
 
@@ -353,14 +361,14 @@ That is the core RecallOps story.
 
 ```text
                     ┌──────────────────────┐
-                    │      Frontend        │
+                    │       Frontend       │
                     │      React/Vite      │
                     └──────────┬───────────┘
                                │
                                │ REST API
-                               ↓
+                               ▼
                     ┌──────────────────────┐
-                    │   Spring Boot API    │
+                    │    Spring Boot API   │
                     │                      │
                     │ Incident Controller  │
                     │ Investigation API    │
@@ -368,39 +376,39 @@ That is the core RecallOps story.
                     │ Agent API            │
                     └──────────┬───────────┘
                                │
-             ┌─────────────────┼──────────────────┐
-             │                 │                  │
-             ↓                 ↓                  ↓
-     ┌──────────────┐  ┌────────────────┐  ┌───────────────┐
-     │ Incident     │  │ Investigation  │  │ Agent         │
-     │ Service      │  │ Service        │  │ Reasoning     │
-     └──────────────┘  └────────────────┘  └───────────────┘
-             │                 │                  │
-             │                 ↓                  │
-             │        ┌────────────────┐          │
-             │        │ State Machine  │          │
-             │        └────────────────┘          │
-             │                 │                  │
-             └─────────────────┼──────────────────┘
-                               ↓
-                    ┌──────────────────────┐
-                    │   Recovery Service   │
-                    │                      │
-                    │ Load state           │
-                    │ Load history         │
-                    │ Load working memory  │
-                    │ Reconstruct context  │
-                    └──────────┬───────────┘
-                               │
-                               ↓
-                    ┌──────────────────────┐
-                    │     CockroachDB      │
-                    │                      │
-                    │ Incidents             │
-                    │ Investigations        │
-                    │ State History         │
-                    │ Working Memory        │
-                    └──────────────────────┘
+             ┌─────────────────┼─────────────────┐
+             │                 │                 │
+             ▼                 ▼                 ▼
+     ┌──────────────┐  ┌────────────────┐  ┌────────────────┐
+     │   Incident   │  │ Investigation  │  │    Reasoning   │
+     │   Service    │  │    Service     │  │     Engine     │
+     └──────────────┘  └───────┬────────┘  └───────┬────────┘
+                               │                   │
+                               ▼                   │
+                       ┌────────────────┐          │
+                       │ State Machine  │          │
+                       └───────┬────────┘          │
+                               │                   │
+                               └─────────┬─────────┘
+                                         ▼
+                              ┌──────────────────────┐
+                              │   Recovery Service   │
+                              │                      │
+                              │ Load investigation   │
+                              │ Load state history   │
+                              │ Load working memory  │
+                              │ Reconstruct context  │
+                              └──────────┬───────────┘
+                                         │
+                                         ▼
+                              ┌──────────────────────┐
+                              │     CockroachDB       │
+                              │                      │
+                              │ Incidents             │
+                              │ Investigations        │
+                              │ State History         │
+                              │ Working Memory        │
+                              └──────────────────────┘
 ```
 
 ---
@@ -409,7 +417,7 @@ That is the core RecallOps story.
 
 ## Backend
 
-- Java
+- Java 21+
     
 - Spring Boot
     
@@ -431,22 +439,24 @@ That is the core RecallOps story.
 - Transactional persistence
     
 
-## Agent
+## Agent / Reasoning
 
-RecallOps currently uses a deterministic reasoning engine for the MVP.
+The current MVP uses a **deterministic reasoning engine**.
 
-This provides:
+This is intentional.
+
+The deterministic engine provides:
 
 - Reproducible demonstrations
     
-- Predictable agent decisions
+- Predictable decisions
     
-- Reliable testing
+- Reliable automated tests
     
-- No dependency on an external LLM during the core crash/recovery demonstration
+- No dependency on an external LLM for the core crash/recovery workflow
     
 
-The reasoning layer is intentionally abstracted behind an interface so that an LLM-powered implementation can be introduced without redesigning the persistence architecture.
+The reasoning layer is abstracted behind an interface, allowing an LLM-powered implementation to be introduced later without redesigning the persistence architecture.
 
 ## Frontend
 
@@ -459,46 +469,33 @@ The reasoning layer is intentionally abstracted behind an interface so that an L
 - CSS
     
 
-The frontend provides the interactive MVP experience for:
-
-- Creating incidents
-    
-- Starting investigations
-    
-- Viewing investigation state
-    
-- Inspecting working memory
-    
-- Simulating failures
-    
-- Observing recovery
-    
+The frontend provides the interactive MVP interface for interacting with the incident and investigation workflow.
 
 ---
 
 # Why CockroachDB?
 
-The central requirement of RecallOps is durable agent memory.
+The central requirement of RecallOps is **durable agent memory**.
 
-CockroachDB provides the transactional persistence layer required to keep the investigation state consistent.
+CockroachDB provides the transactional persistence layer required to keep investigation state durable and consistent.
 
-RecallOps uses the database for:
+Conceptually:
 
 ```text
 Incident
-    │
-    ├── Investigation
-    │       │
-    │       ├── State
-    │       ├── State History
-    │       └── Working Memory
-    │
-    └── Resolution
+   │
+   ├── Investigation
+   │       │
+   │       ├── Current State
+   │       ├── State History
+   │       └── Working Memory
+   │
+   └── Resolution
 ```
 
-The database is therefore not simply used as application storage.
+The database is therefore more than simple application storage.
 
-It becomes the durable memory layer that allows the agent to survive application failure.
+It acts as the durable memory layer that allows the investigation to survive application failure.
 
 ---
 
@@ -510,7 +507,7 @@ RecallOps separates persistent memory into structured components.
 
 Represents the operational problem being investigated.
 
-Typical information:
+Typical information includes:
 
 - Incident ID
     
@@ -533,7 +530,7 @@ Typical information:
 
 Represents the agent's investigation lifecycle.
 
-Typical information:
+Typical information includes:
 
 - Investigation ID
     
@@ -568,13 +565,13 @@ ANALYZING
 RESOLVED
 ```
 
-This provides an auditable history of the investigation.
+This provides an auditable history of the investigation lifecycle.
 
 ---
 
 ## Working Memory
 
-Working memory represents the agent's current reasoning context.
+Working memory represents the investigation's current reasoning context.
 
 It can contain:
 
@@ -595,9 +592,9 @@ It can contain:
 - Investigation context
     
 
-The purpose is simple:
+The goal is simple:
 
-> **If the process disappears, the agent should still know what it was doing.**
+> **If the process disappears, the investigation should still know what it was doing.**
 
 ---
 
@@ -605,39 +602,39 @@ The purpose is simple:
 
 RecallOps prevents arbitrary investigation state changes.
 
-The investigation lifecycle is controlled by a state machine.
+The investigation lifecycle is controlled by an explicit state machine.
 
 Conceptually:
 
 ```text
 CREATED
    │
-   ↓
+   ▼
 INVESTIGATING
    │
-   ↓
+   ▼
 ANALYZING
    │
-   ├──────────────→ WAITING_FOR_EVIDENCE
+   ├──────────────► WAITING_FOR_EVIDENCE
    │                         │
-   │                         ↓
+   │                         ▼
    └──────────────────── ANALYZING
                              │
-                             ↓
+                             ▼
                           RESOLVED
 ```
 
 Invalid transitions are rejected.
 
-This protects the integrity of the investigation lifecycle.
+This protects the integrity of the investigation lifecycle and makes recovery deterministic.
 
 ---
 
 # Failure Recovery
 
-The most important architectural property of RecallOps is recovery.
+Failure recovery is the central architectural property of RecallOps.
 
-Suppose the agent reaches:
+Suppose the investigation reaches:
 
 ```text
 State:
@@ -654,15 +651,15 @@ Next Action:
 Inspect connection pool
 ```
 
-The process crashes.
+The process then crashes.
 
-The following information is still available:
+The durable state remains:
 
 ```text
 CockroachDB
     │
     ├── Investigation
-    ├── State
+    ├── Current State
     ├── State History
     └── Working Memory
 ```
@@ -683,7 +680,7 @@ Reconstruct context
 Continue investigation
 ```
 
-No manual reconstruction is required.
+This is the core reliability property demonstrated by the MVP.
 
 ---
 
@@ -721,7 +718,7 @@ Used to create investigations, inspect them, and perform controlled state transi
 POST   /api/investigations/{id}/agent/run
 ```
 
-Triggers the reasoning engine for the investigation.
+Triggers the reasoning engine for an investigation.
 
 ---
 
@@ -742,9 +739,9 @@ Used to inspect and update persistent working memory.
 GET    /api/investigations/{id}/recover
 ```
 
-Loads the durable investigation state and reconstructs the investigation context after a restart.
+Loads durable investigation state and reconstructs the investigation context.
 
-> See `backend/recallops-api-mappings.txt` for the current API mapping.
+See [`backend/recallops-api-mappings.txt`](https://chatgpt.com/c/backend/recallops-api-mappings.txt) for the current API mapping.
 
 ---
 
@@ -782,7 +779,6 @@ RecallOps/
 │   │   │   │   └── state/
 │   │   │   │
 │   │   │   └── memory/
-│   │   │       ├── controller
 │   │   │       ├── dto/
 │   │   │       ├── entity/
 │   │   │       ├── repository/
@@ -792,7 +788,7 @@ RecallOps/
 │   │
 │   ├── pom.xml
 │   ├── mvnw
-│   └── application.yml
+│   └── src/main/resources/
 │
 ├── frontend/
 │   ├── src/
@@ -824,7 +820,7 @@ Install:
 - CockroachDB
     
 
-A CockroachDB cluster can be used either locally or through CockroachDB Cloud.
+A CockroachDB cluster can be used locally or through CockroachDB Cloud.
 
 ---
 
@@ -839,21 +835,21 @@ cd RecallOps
 
 ## 2. Configure environment variables
 
-Create a local `.env` file:
+Create a local environment file:
 
 ```bash
 cp .env.example .env
 ```
 
-Then configure:
+Configure:
 
 ```env
 DB_PASSWORD=your_actual_database_password
 ```
 
-The `.env` file is intentionally ignored by Git.
+The `.env` file is ignored by Git.
 
-Never commit real credentials.
+**Never commit real credentials.**
 
 ---
 
@@ -876,6 +872,8 @@ This keeps credentials outside the source code.
 ---
 
 ## 4. Start the backend
+
+From the repository root:
 
 ```bash
 cd backend
@@ -900,7 +898,7 @@ npm install
 npm run dev
 ```
 
-Vite will provide the local frontend URL.
+Vite will provide the local development URL.
 
 ---
 
@@ -931,13 +929,13 @@ The intended MVP demonstration is:
 ```text
 1. Open RecallOps
         ↓
-2. Create incident
+2. Create an incident
         ↓
-3. Start investigation
+3. Start an investigation
         ↓
-4. Agent begins reasoning
+4. Run the reasoning engine
         ↓
-5. Working memory is persisted
+5. Persist working memory
         ↓
 6. Simulate application crash
         ↓
@@ -945,12 +943,12 @@ The intended MVP demonstration is:
         ↓
 8. Recover investigation
         ↓
-9. Agent resumes from persisted state
+9. Restore durable context
         ↓
-10. Complete investigation
+10. Continue investigation
 ```
 
-The key visual comparison is:
+The key comparison is:
 
 ```text
 BEFORE CRASH
@@ -984,39 +982,46 @@ Inspect connection pool
 RESUMED
 ```
 
-This demonstrates that the agent's memory survived the application failure.
+The demonstration shows that the investigation's durable state survives the failure of the application process.
 
 ---
 
-# Design Principles
+# Engineering Decisions
 
-## 1. Durable state over process memory
+## Durable state instead of process memory
 
-Important agent state must survive process termination.
-
----
-
-## 2. Explicit state transitions
-
-The investigation lifecycle is modeled as a state machine rather than arbitrary status updates.
+Important investigation context is persisted rather than relying exclusively on Java runtime memory.
 
 ---
 
-## 3. Recoverability
+## Explicit state transitions
 
-A restarted process should be able to reconstruct an investigation from durable state.
+Investigation lifecycle changes are controlled by a state machine.
 
----
-
-## 4. Deterministic MVP
-
-The core demonstration should remain reliable and reproducible.
-
-Therefore, the MVP reasoning engine is deterministic while the architecture remains extensible toward LLM-based reasoning.
+This prevents arbitrary status changes and creates an auditable lifecycle.
 
 ---
 
-## 5. Separation of concerns
+## Deterministic MVP
+
+The current reasoning engine is deterministic.
+
+This makes the core demonstration:
+
+- Reproducible
+    
+- Testable
+    
+- Predictable
+    
+- Independent of external LLM availability
+    
+
+The architecture remains open to replacing the deterministic engine with an LLM-powered implementation.
+
+---
+
+## Separation of concerns
 
 The system separates:
 
@@ -1025,20 +1030,20 @@ Incident Management
         ↓
 Investigation Lifecycle
         ↓
-Agent Reasoning
+Reasoning
         ↓
-Persistent Working Memory
+Working Memory
         ↓
 Recovery
 ```
 
-This keeps the system easier to test and evolve.
+This keeps the system easier to reason about, test, and extend.
 
 ---
 
 # Why This Matters for AI Agents
 
-Traditional application recovery often focuses on restoring:
+Traditional fault-tolerant systems often focus on recovering:
 
 ```text
 Database state
@@ -1047,7 +1052,7 @@ Transactions
 User sessions
 ```
 
-AI agents introduce another important dimension:
+AI agents introduce another important form of state:
 
 ```text
 Reasoning state
@@ -1068,33 +1073,40 @@ An agent may spend significant time developing:
 - Next actions
     
 
-If that state exists only in process memory, a crash can destroy the agent's progress.
+If that context exists only in process memory, a crash can destroy the agent's progress.
 
-RecallOps explores a more reliable model:
+RecallOps explores a more resilient architecture:
 
 ```text
-AI Agent
-   │
-   │ reasoning
-   ↓
-Working Memory
-   │
-   │ checkpoint
-   ↓
-Durable Database
-   │
-   │ recovery
-   ↓
-AI Agent
+             AI Agent
+                │
+                │ reasoning
+                ▼
+         Working Memory
+                │
+                │ checkpoint
+                ▼
+          CockroachDB
+                │
+                │ application crash
+                ▼
+       Recovery Service
+                │
+                │ reconstruct
+                ▼
+          AI Agent
+                │
+                ▼
+           Resume
 ```
 
-This is the foundation for building more resilient long-running AI systems.
+This is the foundation for building reliable long-running AI systems.
 
 ---
 
 # Current MVP Scope
 
-### Included
+## Included
 
 - Incident management
     
@@ -1121,11 +1133,11 @@ This is the foundation for building more resilient long-running AI systems.
 - CockroachDB persistence
     
 
-### Intentionally Out of Scope
+## Intentionally Out of Scope
 
-The MVP does not attempt to build a complete production SRE platform.
+RecallOps is not intended to be a complete production SRE platform.
 
-It intentionally focuses on one architectural problem:
+The MVP deliberately focuses on one architectural problem:
 
 > **Persistent agent memory and recovery across application crashes.**
 
@@ -1153,6 +1165,10 @@ Future versions can add:
     
 - Kubernetes-based failure testing
     
+- Distributed worker execution
+    
+- Event-driven orchestration
+    
 
 ---
 
@@ -1162,31 +1178,35 @@ The deterministic reasoning engine can eventually be replaced or extended with a
 
 ```text
                     ┌──────────────────┐
-                    │    LLM Agent     │
+                    │     LLM Agent    │
                     └────────┬─────────┘
                              │
-                    Tool calls / reasoning
+                       Reasoning / Tools
                              │
-                             ↓
+                             ▼
                     ┌──────────────────┐
-                    │ Working Memory  │
+                    │ Working Memory   │
                     └────────┬─────────┘
                              │
-                       checkpoint
-                             ↓
-                    ┌──────────────────┐
-                    │  CockroachDB     │
-                    └──────────────────┘
+                         Checkpoint
                              │
-                           crash
-                             ↓
+                             ▼
+                    ┌──────────────────┐
+                    │   CockroachDB    │
+                    └────────┬─────────┘
+                             │
+                           Crash
+                             │
+                             ▼
                     ┌──────────────────┐
                     │ Recovery Service │
                     └────────┬─────────┘
                              │
-                             ↓
+                         Reconstruct
+                             │
+                             ▼
                     ┌──────────────────┐
-                    │ Resume Agent     │
+                    │  Resume Agent    │
                     └──────────────────┘
 ```
 
@@ -1194,33 +1214,11 @@ The persistence architecture therefore remains useful even as the intelligence l
 
 ---
 
-# Hackathon Story
-
-RecallOps is built around a simple demonstration:
-
-> **An AI agent should not forget an investigation just because the process running it crashed.**
-
-The demo intentionally creates a failure at the most interesting point in the investigation.
-
-The application disappears.
-
-The database does not.
-
-The investigation survives.
-
-When the application returns, RecallOps reconstructs the agent's durable context and continues.
-
-That is the central idea behind RecallOps:
-
-**Agents should have memory that survives failure.**
-
----
-
 # Security
 
 Secrets are intentionally kept outside source control.
 
-The repository ignores:
+The repository ignores sensitive local configuration such as:
 
 ```text
 .env
@@ -1241,11 +1239,121 @@ as the template for local configuration.
 
 ---
 
-# License
+# Hackathon Context
 
-This project is currently an MVP / hackathon project.
+RecallOps was built around the idea of **persistent memory for AI agents**.
 
-License information can be added when the project is prepared for public distribution.
+The project focuses on demonstrating how an agent can maintain durable investigation state even when the application process executing the agent fails.
+
+The central demonstration is intentionally simple:
+
+```text
+Agent investigates
+       ↓
+Agent stores memory
+       ↓
+Application crashes
+       ↓
+Application restarts
+       ↓
+Memory is recovered
+       ↓
+Investigation continues
+```
+
+The goal is not to build the world's most sophisticated SRE agent.
+
+The goal is to demonstrate a reliable foundation on which more capable autonomous agents can be built.
+
+---
+
+# Roadmap
+
+### Phase 1 — MVP
+
+-  Incident management
+    
+-  Investigation lifecycle
+    
+-  State machine
+    
+-  Persistent state history
+    
+-  Working memory
+    
+-  Deterministic reasoning engine
+    
+-  Recovery service
+    
+-  REST APIs
+    
+-  React frontend
+    
+-  Crash/restart workflow
+    
+-  Persistence tests
+    
+
+### Phase 2 — AI Agent
+
+-  LLM-powered reasoning
+    
+-  Tool calling
+    
+-  Structured outputs
+    
+-  Agent planning
+    
+-  Tool result persistence
+    
+-  Reasoning checkpointing
+    
+
+### Phase 3 — SRE Intelligence
+
+-  Log analysis
+    
+-  Metrics analysis
+    
+-  Historical incident retrieval
+    
+-  Vector search
+    
+-  Root-cause analysis
+    
+-  Remediation recommendations
+    
+
+### Phase 4 — Production Reliability
+
+-  Authentication
+    
+-  Authorization
+    
+-  Observability
+    
+-  Distributed workers
+    
+-  Event-driven execution
+    
+-  Kubernetes deployment
+    
+-  Automated failure injection
+    
+-  Horizontal scaling
+    
+
+---
+
+# Project Status
+
+**Status: MVP complete**
+
+The current implementation demonstrates the core architectural concept:
+
+> **Persistent investigation state can survive application failure and be recovered after restart.**
+
+The project is intentionally small in scope so that the crash-recovery mechanism remains clear, observable, and demonstrable.
 
 ---
 
@@ -1268,3 +1376,10 @@ Built as an exploration of:
 - AI-native system architecture
     
 
+---
+
+# License
+
+This project is currently an MVP / hackathon project.
+
+License information can be added when the project is prepared for broader public distribution.
