@@ -3,8 +3,8 @@ spring:
     name: backend
 
   datasource:
-    url: jdbc:postgresql://recallops-dev-30784.j77.aws-ap-south-1.cockroachlabs.cloud:26257/recallops?sslmode=verify-full
-    username: recallops
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
     password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
 
