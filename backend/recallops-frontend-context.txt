@@ -1,0 +1,1139 @@
+============================================================
+FILE: src/main/java/com/recallops/investigation/controller/InvestigationController.java
+============================================================
+package com.recallops.investigation.controller;
+
+import com.recallops.investigation.dto.InvestigationRecoveryResponse;
+import com.recallops.investigation.dto.InvestigationResponse;
+import com.recallops.investigation.dto.TransitionInvestigationRequest;
+import com.recallops.investigation.service.InvestigationRecoveryService;
+import com.recallops.investigation.service.InvestigationService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/v1")
+@RequiredArgsConstructor
+public class InvestigationController {
+
+    private final InvestigationService investigationService;
+    private final InvestigationRecoveryService investigationRecoveryService;
+
+    @PostMapping("/incidents/{incidentId}/investigation")
+    public ResponseEntity<InvestigationResponse> startInvestigation(
+            @PathVariable UUID incidentId) {
+
+        InvestigationResponse response =
+                investigationService.startInvestigation(incidentId);
+
+        return ResponseEntity
+                .status(HttpStatus.CREATED)
+                .body(response);
+    }
+
+    @GetMapping("/investigations/{investigationId}")
+    public ResponseEntity<InvestigationResponse> getInvestigation(
+            @PathVariable UUID investigationId) {
+
+        InvestigationResponse response =
+                investigationService.getInvestigation(investigationId);
+
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/incidents/{incidentId}/investigation")
+    public ResponseEntity<InvestigationResponse> getInvestigationByIncident(
+            @PathVariable UUID incidentId) {
+
+        InvestigationResponse response =
+                investigationService.getInvestigationByIncident(incidentId);
+
+        return ResponseEntity.ok(response);
+    }
+
+    @PatchMapping("/investigations/{investigationId}/state")
+    public ResponseEntity<InvestigationResponse> transition(
+            @PathVariable UUID investigationId,
+            @Valid @RequestBody TransitionInvestigationRequest request) {
+
+        InvestigationResponse response =
+                investigationService.transition(
+                        investigationId,
+                        request.targetState()
+                );
+
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/investigations/{investigationId}/recover")
+    public ResponseEntity<InvestigationRecoveryResponse> recover(
+            @PathVariable UUID investigationId
+    ) {
+
+        return ResponseEntity.ok(
+                investigationRecoveryService.recover(
+                        investigationId
+                )
+        );
+    }
+}
+============================================================
+FILE: src/main/java/com/recallops/investigation/service/InvalidInvestigationTransitionException.java
+============================================================
+package com.recallops.investigation.service;
+
+public class InvalidInvestigationTransitionException extends RuntimeException {
+
+    public InvalidInvestigationTransitionException(String message) {
+        super(message);
+    }
+}
+============================================================
+FILE: src/main/java/com/recallops/investigation/service/InvestigationStateMachine.java
+============================================================
+package com.recallops.investigation.service;
+
+public class InvestigationStateMachine {
+}
+
+============================================================
+FILE: src/main/java/com/recallops/investigation/service/InvestigationRecoveryService.java
+============================================================
+package com.recallops.investigation.service;
+
+import com.recallops.common.exception.ResourceNotFoundException;
+import com.recallops.investigation.dto.InvestigationRecoveryResponse;
+import com.recallops.investigation.entity.Investigation;
+import com.recallops.investigation.entity.InvestigationStateHistory;
+import com.recallops.investigation.repository.InvestigationRepository;
+import com.recallops.investigation.repository.InvestigationStateHistoryRepository;
+import com.recallops.investigation.state.InvestigationState;
+import com.recallops.memory.dto.WorkingMemoryResponse;
+import com.recallops.memory.repository.WorkingMemoryRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.ApplicationArguments;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class InvestigationRecoveryService implements ApplicationRunner {
+
+    private final InvestigationRepository investigationRepository;
+    private final InvestigationStateHistoryRepository stateHistoryRepository;
+    private final WorkingMemoryRepository workingMemoryRepository;
+
+    /**
+     * Runs automatically when Spring Boot finishes starting.
+     *
+     * Any unresolved investigation is considered recoverable.
+     */
+    @Override
+    public void run(ApplicationArguments args) {
+
+        log.info("Starting investigation recovery scan...");
+
+        List<Investigation> investigations =
+                investigationRepository.findByResolvedFalse();
+
+        if (investigations.isEmpty()) {
+            log.info(
+                    "No unfinished investigations found during startup recovery."
+            );
+            return;
+        }
+
+        log.info(
+                "Found {} unfinished investigation(s) during startup recovery.",
+                investigations.size()
+        );
+
+        for (Investigation investigation : investigations) {
+
+            try {
+
+                recoverInternal(investigation);
+
+                log.info(
+                        "Investigation {} successfully recovered.",
+                        investigation.getId()
+                );
+
+            } catch (Exception exception) {
+
+                log.error(
+                        "Failed to recover investigation {}",
+                        investigation.getId(),
+                        exception
+                );
+            }
+        }
+    }
+
+    /**
+     * Manual recovery endpoint.
+     */
+    @Transactional
+    public InvestigationRecoveryResponse recover(
+            UUID investigationId
+    ) {
+
+        Investigation investigation =
+                investigationRepository.findById(investigationId)
+                        .orElseThrow(() ->
+                                new ResourceNotFoundException(
+                                        "Investigation not found: "
+                                                + investigationId
+                                )
+                        );
+
+        return recoverInternal(investigation);
+    }
+
+    /**
+     * Recovery is intentionally separate from the normal state machine.
+     *
+     * A process restart is not a normal business transition.
+     * The investigation is restored to RESUMED so the agent can continue.
+     */
+    @Transactional
+    protected InvestigationRecoveryResponse recoverInternal(
+            Investigation investigation
+    ) {
+
+        InvestigationState previousState =
+                investigation.getCurrentState();
+
+        /*
+         * Already resolved investigations do not need recovery.
+         */
+        if (investigation.isResolved()) {
+
+            WorkingMemoryResponse workingMemory =
+                    getWorkingMemory(investigation.getId());
+
+            return new InvestigationRecoveryResponse(
+                    investigation.getId(),
+                    investigation.getIncident().getId(),
+                    previousState,
+                    previousState,
+                    workingMemory
+            );
+        }
+
+        /*
+         * Do not create a duplicate recovery event if the investigation
+         * is already RESUMED.
+         */
+        if (previousState == InvestigationState.RESUMED) {
+
+            WorkingMemoryResponse workingMemory =
+                    getWorkingMemory(investigation.getId());
+
+            return new InvestigationRecoveryResponse(
+                    investigation.getId(),
+                    investigation.getIncident().getId(),
+                    previousState,
+                    InvestigationState.RESUMED,
+                    workingMemory
+            );
+        }
+
+        Instant now = Instant.now();
+
+        investigation.setCurrentState(
+                InvestigationState.RESUMED
+        );
+
+        Investigation saved =
+                investigationRepository.save(investigation);
+
+        InvestigationStateHistory history =
+                InvestigationStateHistory.builder()
+                        .investigation(saved)
+                        .fromState(previousState)
+                        .toState(InvestigationState.RESUMED)
+                        .transitionedAt(now)
+                        .build();
+
+        stateHistoryRepository.save(history);
+
+        WorkingMemoryResponse workingMemory =
+                getWorkingMemory(saved.getId());
+
+        return new InvestigationRecoveryResponse(
+                saved.getId(),
+                saved.getIncident().getId(),
+                previousState,
+                InvestigationState.RESUMED,
+                workingMemory
+        );
+    }
+
+    private WorkingMemoryResponse getWorkingMemory(
+            UUID investigationId
+    ) {
+
+        return workingMemoryRepository
+                .findByInvestigationId(investigationId)
+                .map(memory -> new WorkingMemoryResponse(
+                        memory.getId(),
+                        memory.getInvestigation().getId(),
+                        memory.getCurrentHypothesis(),
+                        memory.getConfidence(),
+                        memory.getObservations(),
+                        memory.getCompletedActions(),
+                        memory.getNextAction(),
+                        memory.getVersion(),
+                        memory.getCreatedAt(),
+                        memory.getUpdatedAt()
+                ))
+                .orElse(null);
+    }
+}
+============================================================
+FILE: src/main/java/com/recallops/investigation/service/InvestigationService.java
+============================================================
+package com.recallops.investigation.service;
+
+import com.recallops.investigation.entity.InvestigationStateHistory;
+import com.recallops.investigation.repository.InvestigationStateHistoryRepository;
+import com.recallops.common.exception.ConflictException;
+import com.recallops.common.exception.ResourceNotFoundException;
+import com.recallops.incident.entity.Incident;
+import com.recallops.incident.repository.IncidentRepository;
+import com.recallops.investigation.dto.InvestigationResponse;
+import com.recallops.investigation.entity.Investigation;
+import com.recallops.investigation.repository.InvestigationRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import com.recallops.investigation.state.InvestigationState;
+import com.recallops.investigation.state.InvestigationStateTransition;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+public class InvestigationService {
+
+    private final InvestigationRepository investigationRepository;
+    private final IncidentRepository incidentRepository;
+    private final InvestigationStateHistoryRepository stateHistoryRepository;
+
+    @Transactional
+    public InvestigationResponse startInvestigation(UUID incidentId) {
+
+        Incident incident = incidentRepository.findById(incidentId)
+                .orElseThrow(() ->
+                        new ResourceNotFoundException(
+                                "Incident not found: " + incidentId
+                        ));
+
+        investigationRepository.findByIncidentId(incidentId)
+                .ifPresent(existing -> {
+                    throw new ConflictException(
+                            "Investigation already exists for incident: "
+                                    + incidentId
+                    );
+                });
+
+        Investigation investigation = Investigation.builder()
+                .incident(incident)
+                .build();
+
+        Investigation savedInvestigation =
+                investigationRepository.save(investigation);
+
+        return toResponse(savedInvestigation);
+    }
+
+    @Transactional(readOnly = true)
+    public InvestigationResponse getInvestigation(UUID investigationId) {
+
+        Investigation investigation =
+                investigationRepository.findById(investigationId)
+                        .orElseThrow(() ->
+                                new ResourceNotFoundException(
+                                        "Investigation not found: "
+                                                + investigationId
+                                ));
+
+        return toResponse(investigation);
+    }
+
+    @Transactional(readOnly = true)
+    public InvestigationResponse getInvestigationByIncident(
+            UUID incidentId) {
+
+        Investigation investigation =
+                investigationRepository.findByIncidentId(incidentId)
+                        .orElseThrow(() ->
+                                new ResourceNotFoundException(
+                                        "Investigation not found for incident: "
+                                                + incidentId
+                                ));
+
+        return toResponse(investigation);
+    }
+
+    private InvestigationResponse toResponse(
+            Investigation investigation) {
+
+        return new InvestigationResponse(
+                investigation.getId(),
+                investigation.getIncident().getId(),
+                investigation.getCurrentState(),
+                investigation.isResolved(),
+                investigation.getResolvedAt(),
+                investigation.getCreatedAt(),
+                investigation.getUpdatedAt()
+        );
+    }
+
+    @Transactional
+    public InvestigationResponse transition(
+            UUID investigationId,
+            InvestigationState targetState) {
+
+        Investigation investigation = investigationRepository
+                .findById(investigationId)
+                .orElseThrow(() ->
+                        new ResourceNotFoundException(
+                                "Investigation not found: " + investigationId
+                        ));
+
+        InvestigationState currentState =
+                investigation.getCurrentState();
+
+        if (!InvestigationStateTransition.isAllowed(
+                currentState,
+                targetState)) {
+
+            throw new ConflictException(
+                    "Invalid investigation state transition: "
+                            + currentState
+                            + " -> "
+                            + targetState
+            );
+        }
+
+        investigation.setCurrentState(targetState);
+
+        if (targetState == InvestigationState.RESOLVED) {
+            investigation.setResolved(true);
+            investigation.setResolvedAt(Instant.now());
+        }
+
+        Investigation saved =
+                investigationRepository.save(investigation);
+
+        InvestigationStateHistory history =
+                InvestigationStateHistory.builder()
+                        .investigation(saved)
+                        .fromState(currentState)
+                        .toState(targetState)
+                        .transitionedAt(Instant.now())
+                        .build();
+
+        stateHistoryRepository.save(history);
+
+        return toResponse(saved);
+    }
+}
+============================================================
+FILE: src/main/java/com/recallops/investigation/dto/TransitionInvestigationRequest.java
+============================================================
+package com.recallops.investigation.dto;
+
+import com.recallops.investigation.state.InvestigationState;
+import jakarta.validation.constraints.NotNull;
+
+public record TransitionInvestigationRequest(
+        @NotNull
+        InvestigationState targetState
+) {
+}
+============================================================
+FILE: src/main/java/com/recallops/investigation/dto/InvestigationResponse.java
+============================================================
+package com.recallops.investigation.dto;
+
+import com.recallops.investigation.state.InvestigationState;
+
+import java.time.Instant;
+import java.util.UUID;
+
+public record InvestigationResponse(
+        UUID id,
+        UUID incidentId,
+        InvestigationState state,
+        boolean resolved,
+        Instant resolvedAt,
+        Instant createdAt,
+        Instant updatedAt
+) {
+}
+============================================================
+FILE: src/main/java/com/recallops/investigation/entity/InvestigationStateHistory.java
+============================================================
+package com.recallops.investigation.entity;
+
+import com.recallops.investigation.state.InvestigationState;
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+@Entity
+@Table(
+        name = "investigation_state_history",
+        indexes = {
+                @Index(
+                        name = "idx_state_history_investigation",
+                        columnList = "investigation_id"
+                ),
+                @Index(
+                        name = "idx_state_history_transitioned_at",
+                        columnList = "transitioned_at"
+                )
+        }
+)
+public class InvestigationStateHistory {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(
+            name = "investigation_id",
+            nullable = false
+    )
+    private Investigation investigation;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "from_state", nullable = false, length = 30)
+    private InvestigationState fromState;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "to_state", nullable = false, length = 30)
+    private InvestigationState toState;
+
+    @Column(name = "transitioned_at", nullable = false)
+    private Instant transitionedAt;
+}
+============================================================
+FILE: src/main/java/com/recallops/investigation/entity/Investigation.java
+============================================================
+package com.recallops.investigation.entity;
+
+import com.recallops.common.entity.BaseAuditableEntity;
+import com.recallops.incident.entity.Incident;
+import com.recallops.investigation.state.InvestigationState;
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+@Entity
+@Table(
+        name = "investigations",
+        indexes = {
+                @Index(
+                        name = "idx_investigation_state",
+                        columnList = "current_state"
+                )
+        }
+)
+public class Investigation extends BaseAuditableEntity {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @OneToOne(fetch = FetchType.LAZY)
+    @JoinColumn(
+            name = "incident_id",
+            nullable = false,
+            unique = true
+    )
+    private Incident incident;
+
+    @Enumerated(EnumType.STRING)
+    @Column(
+            name = "current_state",
+            nullable = false,
+            length = 30
+    )
+    @Builder.Default
+    private InvestigationState currentState = InvestigationState.NEW;
+
+    @Column
+    private Instant resolvedAt;
+
+    @Builder.Default
+    @Column(nullable = false)
+    private boolean resolved = false;
+}
+============================================================
+FILE: src/main/java/com/recallops/common/entity/BaseAuditableEntity.java
+============================================================
+package com.recallops.common.entity;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.EntityListeners;
+import jakarta.persistence.MappedSuperclass;
+import jakarta.persistence.Version;
+import lombok.Getter;
+import org.springframework.data.annotation.CreatedDate;
+import org.springframework.data.annotation.LastModifiedDate;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.time.Instant;
+@MappedSuperclass
+@Getter
+@EntityListeners(AuditingEntityListener.class)
+public abstract class BaseAuditableEntity {
+
+    @Version
+    @Column(nullable = false)
+    private Long version;
+    @CreatedDate
+    @Column(nullable=false,updatable=false)
+    private Instant createdAt;
+    @LastModifiedDate
+    @Column(nullable=false)
+    private Instant updatedAt;
+}
+
+============================================================
+FILE: src/main/java/com/recallops/memory/service/WorkingMemoryService.java
+============================================================
+package com.recallops.memory.service;
+
+import com.recallops.common.exception.ResourceNotFoundException;
+import com.recallops.investigation.entity.Investigation;
+import com.recallops.investigation.repository.InvestigationRepository;
+import com.recallops.memory.dto.UpdateWorkingMemoryRequest;
+import com.recallops.memory.dto.WorkingMemoryResponse;
+import com.recallops.memory.entity.WorkingMemory;
+import com.recallops.memory.repository.WorkingMemoryRepository;
+import org.springframework.transaction.annotation.Transactional;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+public class WorkingMemoryService {
+
+    private final WorkingMemoryRepository workingMemoryRepository;
+    private final InvestigationRepository investigationRepository;
+
+    @Transactional
+    public WorkingMemoryResponse create(
+            UUID investigationId,
+            UpdateWorkingMemoryRequest request
+    ) {
+
+        Investigation investigation =
+                investigationRepository.findById(investigationId)
+                        .orElseThrow(() ->
+                                new ResourceNotFoundException(
+                                        "Investigation not found: "
+                                                + investigationId
+                                )
+                        );
+
+        if (workingMemoryRepository
+                .findByInvestigationId(investigationId)
+                .isPresent()) {
+
+            throw new IllegalStateException(
+                    "Working memory already exists for investigation: "
+                            + investigationId
+            );
+        }
+
+        WorkingMemory memory = WorkingMemory.builder()
+                .investigation(investigation)
+                .currentHypothesis(request.currentHypothesis())
+                .confidence(request.confidence())
+                .observations(request.observations())
+                .completedActions(request.completedActions())
+                .nextAction(request.nextAction())
+                .build();
+
+        return toResponse(
+                workingMemoryRepository.save(memory)
+        );
+    }
+
+    @Transactional(readOnly = true)
+    public WorkingMemoryResponse getByInvestigationId(
+            UUID investigationId
+    ) {
+
+        return workingMemoryRepository
+                .findByInvestigationId(investigationId)
+                .map(this::toResponse)
+                .orElseThrow(() ->
+                        new ResourceNotFoundException(
+                                "Working memory not found for investigation: "
+                                        + investigationId
+                        )
+                );
+    }
+
+    @Transactional
+    public WorkingMemoryResponse update(
+            UUID investigationId,
+            UpdateWorkingMemoryRequest request
+    ) {
+
+        WorkingMemory memory =
+                workingMemoryRepository
+                        .findByInvestigationId(investigationId)
+                        .orElseThrow(() ->
+                                new ResourceNotFoundException(
+                                        "Working memory not found for investigation: "
+                                                + investigationId
+                                )
+                        );
+
+        memory.setCurrentHypothesis(request.currentHypothesis());
+        memory.setConfidence(request.confidence());
+        memory.setObservations(request.observations());
+        memory.setCompletedActions(request.completedActions());
+        memory.setNextAction(request.nextAction());
+
+        return toResponse(
+                workingMemoryRepository.save(memory)
+        );
+    }
+
+    private WorkingMemoryResponse toResponse(
+            WorkingMemory memory
+    ) {
+
+        return new WorkingMemoryResponse(
+                memory.getId(),
+                memory.getInvestigation().getId(),
+                memory.getCurrentHypothesis(),
+                memory.getConfidence(),
+                memory.getObservations(),
+                memory.getCompletedActions(),
+                memory.getNextAction(),
+                memory.getVersion(),
+                memory.getCreatedAt(),
+                memory.getUpdatedAt()
+        );
+    }
+}
+============================================================
+FILE: src/main/java/com/recallops/memory/dto/WorkingMemoryResponse.java
+============================================================
+package com.recallops.memory.dto;
+
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.UUID;
+
+public record WorkingMemoryResponse(
+        UUID id,
+        UUID investigationId,
+        String currentHypothesis,
+        BigDecimal confidence,
+        JsonNode observations,
+        JsonNode completedActions,
+        String nextAction,
+        Long version,
+        Instant createdAt,
+        Instant updatedAt
+) {
+}
+============================================================
+FILE: src/main/java/com/recallops/memory/dto/InvestigationRecoveryResponse.java
+============================================================
+package com.recallops.investigation.dto;
+
+import com.recallops.investigation.state.InvestigationState;
+import com.recallops.memory.dto.WorkingMemoryResponse;
+
+import java.util.UUID;
+
+public record InvestigationRecoveryResponse(
+        UUID investigationId,
+        UUID incidentId,
+        InvestigationState previousState,
+        InvestigationState recoveredState,
+        WorkingMemoryResponse workingMemory
+) {
+}
+============================================================
+FILE: src/main/java/com/recallops/memory/dto/UpdateWorkingMemoryRequest.java
+============================================================
+package com.recallops.memory.dto;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import jakarta.validation.constraints.DecimalMax;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Size;
+
+import java.math.BigDecimal;
+
+public record UpdateWorkingMemoryRequest(
+
+        @Size(max = 2000)
+        String currentHypothesis,
+
+        @DecimalMin("0.0")
+        @DecimalMax("1.0")
+        BigDecimal confidence,
+
+        JsonNode observations,
+
+        JsonNode completedActions,
+
+        @Size(max = 2000)
+        String nextAction
+) {
+}
+============================================================
+FILE: src/main/java/com/recallops/memory/entity/HypothesisStatus.java
+============================================================
+package com.recallops.memory.entity;
+
+public enum HypothesisStatus {
+    ACTIVE,
+    REJECTED,
+    CONFIRMED
+}
+
+============================================================
+FILE: src/main/java/com/recallops/memory/entity/WorkingMemory.java
+============================================================
+package com.recallops.memory.entity;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.recallops.common.entity.BaseAuditableEntity;
+import com.recallops.investigation.entity.Investigation;
+import jakarta.persistence.*;
+import lombok.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
+
+import java.math.BigDecimal;
+import java.util.UUID;
+
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+@Entity
+@Table(
+        name = "working_memory",
+        indexes = {
+                @Index(
+                        name = "idx_working_memory_investigation",
+                        columnList = "investigation_id"
+                )
+        }
+)
+public class WorkingMemory extends BaseAuditableEntity {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @OneToOne(fetch = FetchType.LAZY)
+    @JoinColumn(
+            name = "investigation_id",
+            nullable = false,
+            unique = true
+    )
+    private Investigation investigation;
+
+    @Column(length = 2000)
+    private String currentHypothesis;
+
+    @Column(precision = 5, scale = 4)
+    private BigDecimal confidence;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "JSONB")
+    private JsonNode observations;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "JSONB")
+    private JsonNode completedActions;
+
+    @Column(length = 2000)
+    private String nextAction;
+}
+============================================================
+FILE: src/main/java/com/recallops/incident/controller/IncidentController.java
+============================================================
+package com.recallops.incident.controller;
+
+import com.recallops.incident.dto.CreateIncidentRequest;
+import com.recallops.incident.dto.IncidentResponse;
+import com.recallops.incident.service.IncidentService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/v1/incidents")
+@RequiredArgsConstructor
+public class IncidentController {
+
+    private final IncidentService incidentService;
+
+    @PostMapping
+    public ResponseEntity<IncidentResponse> createIncident(
+            @Valid @RequestBody CreateIncidentRequest request) {
+
+        IncidentResponse response = incidentService.createIncident(request);
+
+        return ResponseEntity
+                .status(HttpStatus.CREATED)
+                .body(response);
+    }
+
+    @GetMapping("/{incidentId}")
+    public ResponseEntity<IncidentResponse> getIncident(
+            @PathVariable UUID incidentId) {
+
+        IncidentResponse response = incidentService.getIncident(incidentId);
+
+        return ResponseEntity.ok(response);
+    }
+}
+============================================================
+FILE: src/main/java/com/recallops/incident/service/IncidentService.java
+============================================================
+package com.recallops.incident.service;
+
+import com.recallops.common.exception.ResourceNotFoundException;
+import com.recallops.incident.dto.CreateIncidentRequest;
+import com.recallops.incident.dto.IncidentResponse;
+import com.recallops.incident.entity.Incident;
+import com.recallops.incident.repository.IncidentRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+public class IncidentService {
+
+    private final IncidentRepository incidentRepository;
+
+    @Transactional
+    public IncidentResponse createIncident(CreateIncidentRequest request) {
+
+        Incident incident = Incident.builder()
+                .title(request.title())
+                .description(request.description())
+                .affectedService(request.affectedService())
+                .severity(request.severity())
+                .build();
+
+        Incident savedIncident = incidentRepository.save(incident);
+
+        return toResponse(savedIncident);
+    }
+
+    @Transactional(readOnly = true)
+    public IncidentResponse getIncident(UUID incidentId) {
+
+        Incident incident = incidentRepository.findById(incidentId)
+                .orElseThrow(() ->
+                        new ResourceNotFoundException(
+                                "Incident not found: " + incidentId
+                        ));
+
+        return toResponse(incident);
+    }
+
+    private IncidentResponse toResponse(Incident incident) {
+
+        return new IncidentResponse(
+                incident.getId(),
+                incident.getTitle(),
+                incident.getDescription(),
+                incident.getAffectedService(),
+                incident.getSeverity(),
+                incident.getStatus(),
+                incident.getCreatedAt(),
+                incident.getUpdatedAt()
+        );
+    }
+}
+============================================================
+FILE: src/main/java/com/recallops/incident/dto/IncidentResponse.java
+============================================================
+package com.recallops.incident.dto;
+
+import com.recallops.incident.entity.IncidentSeverity;
+import com.recallops.incident.entity.IncidentStatus;
+
+import java.time.Instant;
+import java.util.UUID;
+
+public record IncidentResponse(
+        UUID id,
+        String title,
+        String description,
+        String affectedService,
+        IncidentSeverity severity,
+        IncidentStatus status,
+        Instant createdAt,
+        Instant updatedAt
+) {
+}
+
+============================================================
+FILE: src/main/java/com/recallops/incident/dto/CreateIncidentRequest.java
+============================================================
+package com.recallops.incident.dto;
+
+import com.recallops.incident.entity.IncidentSeverity;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record CreateIncidentRequest (
+    @NotBlank
+    @Size(max=200)
+    String title,
+
+    @NotBlank
+    @Size(max=2000)
+    String description,
+
+    @NotBlank
+    @Size(max=100)
+    String affectedService,
+
+    @NotNull
+    IncidentSeverity severity
+){
+}
+
+============================================================
+FILE: src/main/java/com/recallops/incident/entity/IncidentStatus.java
+============================================================
+package com.recallops.incident.entity;
+
+public enum IncidentStatus {
+    OPEN,
+    INVESTIGATING,
+    RESOLVED,
+    CLOSED
+}
+
+============================================================
+FILE: src/main/java/com/recallops/incident/entity/IncidentSeverity.java
+============================================================
+package com.recallops.incident.entity;
+
+public enum IncidentSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+}
+
+============================================================
+FILE: src/main/java/com/recallops/incident/entity/Incident.java
+============================================================
+package com.recallops.incident.entity;
+
+import com.recallops.common.entity.BaseAuditableEntity;
+import jakarta.persistence.*;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import lombok.*;
+import java.util.UUID;
+
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+@Entity
+@Table(
+        name= "incidents",
+        indexes = {
+                @Index(name = "idx_incident_status", columnList = "status"),
+                @Index(name = "idx_incident_severity", columnList = "severity")
+        }
+)
+public class Incident extends BaseAuditableEntity {
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @NotBlank
+    @Column(nullable=false,length=200)
+    private String title;
+
+    @NotBlank
+    @Column(nullable=false,length=2000)
+    private String description;
+
+    @NotBlank
+    @Column(nullable=false,length=100)
+    private String affectedService;
+
+    @NotNull
+    @Column(nullable=false,length=30)
+    @Enumerated(EnumType.STRING)
+    private IncidentSeverity severity;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable=false,length=30)
+    @Builder.Default
+    private IncidentStatus status = IncidentStatus.OPEN;
+
+}
+

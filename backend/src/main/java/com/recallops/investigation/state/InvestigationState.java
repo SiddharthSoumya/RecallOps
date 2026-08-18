@@ -1,6 +1,7 @@
 package com.recallops.investigation.state;
 
 public enum InvestigationState {
+
     NEW,
     LOG_ANALYSIS,
     GENERATE_HYPOTHESES,

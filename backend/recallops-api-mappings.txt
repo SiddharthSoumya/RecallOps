@@ -1,0 +1,15 @@
+src/main/java/com/recallops/investigation/agent/InvestigationAgentController.java:12:@RequestMapping("/api/v1/investigations")
+src/main/java/com/recallops/investigation/agent/InvestigationAgentController.java:18:    @PostMapping("/{investigationId}/agent/step")
+src/main/java/com/recallops/investigation/controller/InvestigationController.java:17:@RequestMapping("/api/v1")
+src/main/java/com/recallops/investigation/controller/InvestigationController.java:24:    @PostMapping("/incidents/{incidentId}/investigation")
+src/main/java/com/recallops/investigation/controller/InvestigationController.java:36:    @GetMapping("/investigations/{investigationId}")
+src/main/java/com/recallops/investigation/controller/InvestigationController.java:46:    @GetMapping("/incidents/{incidentId}/investigation")
+src/main/java/com/recallops/investigation/controller/InvestigationController.java:56:    @PatchMapping("/investigations/{investigationId}/state")
+src/main/java/com/recallops/investigation/controller/InvestigationController.java:70:    @PostMapping("/investigations/{investigationId}/recover")
+src/main/java/com/recallops/memory/WorkingMemoryController.java:14:@RequestMapping("/api/v1/investigations/{investigationId}/memory")
+src/main/java/com/recallops/memory/WorkingMemoryController.java:20:    @PostMapping
+src/main/java/com/recallops/memory/WorkingMemoryController.java:36:    @GetMapping
+src/main/java/com/recallops/memory/WorkingMemoryController.java:48:    @PutMapping
+src/main/java/com/recallops/incident/controller/IncidentController.java:15:@RequestMapping("/api/v1/incidents")
+src/main/java/com/recallops/incident/controller/IncidentController.java:21:    @PostMapping
+src/main/java/com/recallops/incident/controller/IncidentController.java:32:    @GetMapping("/{incidentId}")
